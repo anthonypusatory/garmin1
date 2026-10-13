@@ -1,0 +1,12 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Never commit login tokens (they live in ~/.garminconnect by default)
+.garminconnect/
+garmin_tokens.json
+
+# Your personal health data stays on your computer
+garmin/
+logs/
