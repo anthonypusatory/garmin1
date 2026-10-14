@@ -5,6 +5,8 @@ Read-only: this only ever reads from Garmin Connect, never writes to it.
 Usage:
     python sync.py            # last 7 days
     python sync.py --days 3   # last 3 days
+    python sync.py --all-activities --since first --skip-existing
+                              # full history backfill; safe to re-run to resume
 
 Output (in ./garmin/):
     wellness/YYYY-MM-DD.md        one note per day: sleep, HRV, resting HR,
@@ -344,6 +346,12 @@ def write_index(data: dict) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--days", type=int, default=7, help="how many days back to pull (default 7)")
+    ap.add_argument("--since", help="pull wellness from this date (YYYY-MM-DD) instead of --days; "
+                    "'first' means the date of your first workout on file")
+    ap.add_argument("--skip-existing", action="store_true",
+                    help="don't re-download days already in data.json (makes backfills resumable)")
+    ap.add_argument("--all-activities", action="store_true",
+                    help="download your entire workout history, not just the date range")
     args = ap.parse_args()
 
     g = Garmin()
@@ -357,7 +365,6 @@ def main() -> int:
         return 1
 
     today = date.today()
-    start = today - timedelta(days=args.days - 1)
 
     (OUT / "wellness").mkdir(parents=True, exist_ok=True)
     (OUT / "activities").mkdir(parents=True, exist_ok=True)
@@ -366,30 +373,69 @@ def main() -> int:
     data.setdefault("days", {})
     data.setdefault("activities", {})
 
-    acts = []
+    def save():
+        data["last_synced"] = datetime.now().isoformat(timespec="seconds")
+        data_path.write_text(json.dumps(data, indent=2, sort_keys=True))
+
+    def keep(raw):
+        a = clean_activity(raw)
+        data["activities"][str(a["id"])] = a
+        (OUT / "activities" / activity_filename(a)).write_text(activity_note(a))
+
+    n_acts, n_days = 0, 0
     try:
-        for i in range(args.days):
+        # Workouts first: a whole history is only a few requests.
+        if args.all_activities:
+            print("Workouts (entire history)...")
+            page = 0
+            while True:
+                batch = safe(g.get_activities, page * 100, 100) or []
+                for raw in batch:
+                    keep(raw)
+                n_acts += len(batch)
+                print(f"  {n_acts} workouts so far")
+                if len(batch) < 100:
+                    break
+                page += 1
+                time.sleep(1)
+            save()
+
+        if args.since == "first":
+            starts = [a["start_local"][:10] for a in data["activities"].values() if a.get("start_local")]
+            start = date.fromisoformat(min(starts)) if starts else today - timedelta(days=args.days - 1)
+        elif args.since:
+            start = date.fromisoformat(args.since)
+        else:
+            start = today - timedelta(days=args.days - 1)
+
+        if not args.all_activities:
+            print("Workouts...")
+            acts = safe(g.get_activities_by_date, start.isoformat(), today.isoformat()) or []
+            for raw in acts:
+                keep(raw)
+            n_acts = len(acts)
+
+        total = (today - start).days + 1
+        for i in range(total):
             d = (start + timedelta(days=i)).isoformat()
-            print(f"Wellness {d}...")
+            # Always refresh the last 2 days; they change as the day goes on.
+            if args.skip_existing and d in data["days"] and i < total - 2:
+                continue
+            print(f"Wellness {d} ({i + 1}/{total})...")
             w = fetch_day(g, d)
             data["days"][d] = w
             (OUT / "wellness" / f"{d}.md").write_text(day_note(w))
+            n_days += 1
+            if n_days % 25 == 0:
+                save()  # so a long backfill never loses progress
             time.sleep(0.5)  # be gentle with Garmin's servers
-
-        print("Workouts...")
-        acts = safe(g.get_activities_by_date, start.isoformat(), today.isoformat()) or []
-        for raw in acts:
-            a = clean_activity(raw)
-            data["activities"][str(a["id"])] = a
-            (OUT / "activities" / activity_filename(a)).write_text(activity_note(a))
     except GarminConnectTooManyRequestsError:
-        print("Garmin is rate-limiting requests. Saved what we had; try again later.")
+        print("Garmin is rate-limiting requests. Saved what we had; run the same command later to continue.")
 
-    data["last_synced"] = datetime.now().isoformat(timespec="seconds")
-    data_path.write_text(json.dumps(data, indent=2, sort_keys=True))
+    save()
     write_index(data)
-    print(f"Done: {args.days} day(s) of wellness, {len(acts)} workout(s). "
-          f"Notes are in {OUT}")
+    print(f"Done: {n_days} day(s) of wellness, {n_acts} workout(s). "
+          f"{len(data['days'])} days and {len(data['activities'])} workouts on file. Notes are in {OUT}")
     return 0
 
 
